@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>VEIA</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="./styles.css" />
+
+  <!-- Firebase config (OFICIAL DO SEU PROJETO) -->
+  <script>
+    window.firebaseConfig = {
+      apiKey: "AIzaSyCbkzsPdm9SwyOHyrqpGqXLF3AYeBSdfUk",
+      authDomain: "veia-bb9f7.firebaseapp.com",
+      projectId: "veia-bb9f7",
+      storageBucket: "veia-bb9f7.firebasestorage.app",
+      messagingSenderId: "978652892554",
+      appId: "1:978652892554:web:7071a3f545c365e807cc73"
+    };
+  </script>
+</head>
+
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <div>
+      <strong>VEIA</strong>
+      <div class="sub">Estoque doméstico preditivo</div>
+    </div>
+  </div>
+
+  <div class="right">
+    <span id="who" class="tag">offline</span>
+    <button id="btnLogout" class="btn hidden">Sair</button>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- LOGIN -->
+  <section id="viewLogin" class="card">
+    <h1>Entrar</h1>
+    <p class="muted">Escolha o perfil e digite o PIN para acessar.</p>
+
+    <div class="row">
+      <select id="userSelect">
+        <option value="admin">Admin</option>
+        <option value="Veia">Veia</option>
+      </select>
+
+      <input id="pinInput" type="password" placeholder="PIN" inputmode="numeric" />
+
+      <button id="btnLogin" type="button" class="btn primary">Entrar</button>
+    </div>
+  </section>
+
+  <!-- APP -->
+  <section id="viewApp" class="card hidden">
+    <h1>Bem-vindo ao VEIA</h1>
+    <p id="welcome"></p>
+
+   <div class="row">
+  <button id="btnCategorias" class="btn">Categorias</button>
+  <button id="btnItens" class="btn">Itens</button>
+  <button id="btnCompras" class="btn">Compras</button>
+  <button id="btnCheck" class="btn">Check rápido</button>
+</div>
+
+
+    <div id="content"></div>
+  </section>
+
+</main>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
