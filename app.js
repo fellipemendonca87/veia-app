@@ -32,7 +32,7 @@ const db = getFirestore(app);
 // -----------------------------
 // PIN Local (MVP)
 // -----------------------------
-const USERS_PIN = { admin: "2212", Veia: "2212" };
+const USERS_PIN = { admin: "2212", Veia: "1212" };
 
 // -----------------------------
 // UI State
@@ -1138,3 +1138,4 @@ onAuthStateChanged(auth, async () => {
     showLogin();
   }
 });
+
