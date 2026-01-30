@@ -4,7 +4,10 @@
 // + ETAPA 10: Botão "Comprei" (hortifruti => verde; quantidade => soma)
 // + ETAPA 11 (FIX): Admin edita ESTOQUE MÍNIMO + DURAÇÃO (dias) por item (controle quantidade)
 // + FIX BUSCA: debounce + preservar foco/cursor
-// + ETAPA 12 (AJUSTE REGRA): Quantidade = 0 => VERMELHO | <= mínimo => AMARELO | regra do "abriu última unidade" mantém vermelho por tempo
+// + ETAPA 12 (REGRA NOVA):
+//    - qty < mínimo  => VERMELHO
+//    - qty == mínimo => AMARELO
+//    - Data (duração) começa quando ENTRA no VERMELHO (entrouVermelhoEm)
 // =======================================
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
@@ -159,6 +162,10 @@ function parsePositiveNumber(v, fallback = 1) {
   if (!Number.isFinite(n)) return fallback;
   return n <= 0 ? fallback : n;
 }
+function tsToISO(maybeTs) {
+  if (!maybeTs) return null;
+  return (maybeTs?.toDate?.() ? maybeTs.toDate().toISOString() : String(maybeTs));
+}
 
 // -----------------------------
 // Firebase helpers
@@ -210,43 +217,29 @@ function computeHortifrutiSeverity(item) {
 }
 
 /**
- * ETAPA 12 (AJUSTE):
- * - qty === 0 => red (acabou)
- * - qty <= min => yellow (atenção)
- * - regra de tempo continua: qty===1 + abriuUltimaUnidade + passou 70% da duração => red
+ * REGRA NOVA (quantidade):
+ * - qty < min  => red
+ * - qty == min => yellow
+ * - qty > min  => green
  */
 function computeQuantitySeverity(item) {
   const qty = Number(item.quantidadeAtual ?? 0);
   const min = Number(item.quantidadeMinima ?? 1);
-  const dur = Number(item.duracaoMediaDias ?? 7);
 
-  // acabou => vermelho direto
-  if (qty === 0) return "red";
-
-  // abaixo/igual ao mínimo => amarelo
-  if (qty <= min) return "yellow";
-
-  // vermelho por tempo apenas se for a última unidade e já foi aberta
-  if (qty === 1 && item.abriuUltimaUnidade === true && item.abriuEm) {
-    const openedAt = (item.abriuEm?.toDate?.() ? item.abriuEm.toDate().toISOString() : item.abriuEm);
-    const startRed = addDays(openedAt, Math.ceil(dur * 0.7));
-    if (new Date() >= new Date(startRed)) return "red";
-  }
-
+  if (qty < min) return "red";
+  if (qty === min) return "yellow";
   return "green";
 }
 
+/**
+ * Data só quando entra no vermelho:
+ * endDate = entrouVermelhoEm + duracaoMediaDias
+ */
 function computeQuantityEndDate(item) {
-  const qty = Number(item.quantidadeAtual ?? 0);
   const dur = Number(item.duracaoMediaDias ?? 7);
-
-  // só faz sentido estimar "acabar" quando estamos na última unidade e ela foi aberta
-  if (qty !== 1) return null;
-  if (item.abriuUltimaUnidade !== true) return null;
-  if (!item.abriuEm) return null;
-
-  const openedAt = (item.abriuEm?.toDate?.() ? item.abriuEm.toDate().toISOString() : item.abriuEm);
-  return addDays(openedAt, dur);
+  const enteredISO = tsToISO(item.entrouVermelhoEm);
+  if (!enteredISO) return null;
+  return addDays(enteredISO, dur);
 }
 
 function computeItemSeverityAndReason(it) {
@@ -258,19 +251,17 @@ function computeItemSeverityAndReason(it) {
     return { sev, control: "status", reason: "Hortifruti (cor)" };
   }
 
-  const sev = computeQuantitySeverity(it);
-  const endDate = computeQuantityEndDate(it);
-
   const qty = Number(it.quantidadeAtual ?? 0);
   const min = Number(it.quantidadeMinima ?? 1);
 
+  const sev = computeQuantitySeverity(it);
+  const endDate = (sev === "red") ? computeQuantityEndDate(it) : null;
+
   let reason = "OK";
   if (sev === "red") {
-    reason = qty === 0
-      ? "Sem estoque (0)"
-      : `Última unidade acabando (${endDate ? formatBR(endDate) : "sem data"})`;
+    reason = `Abaixo do mínimo (atual: ${qty} | mín: ${min})${endDate ? ` • Dura até ${formatBR(endDate)}` : ""}`;
   } else if (sev === "yellow") {
-    reason = `Abaixo/igual ao mínimo (mín: ${min})`;
+    reason = `No mínimo (atual: ${qty} | mín: ${min})`;
   }
 
   return { sev, control: "quantidade", reason, endDate };
@@ -293,7 +284,7 @@ async function handleComprei(it, currentUser, returnTo) {
 
   // Quantidade: pergunta quantidade comprada
   const boughtStr = prompt(`Quantas unidades você comprou de "${it.name}"?`, "1");
-  if (boughtStr === null) return; // cancelou
+  if (boughtStr === null) return;
 
   const bought = parsePositiveInt(boughtStr);
   if (!bought) return alert("Digite um número inteiro maior que 0.");
@@ -304,10 +295,13 @@ async function handleComprei(it, currentUser, returnTo) {
   const oldQty = Number(current.quantidadeAtual ?? 0);
   const newQty = oldQty + bought;
 
+  // Se voltou a ficar >= mínimo, limpa entrouVermelhoEm
+  const min = Number(current.quantidadeMinima ?? 1);
+  const shouldClearRed = newQty >= min;
+
   await updateDoc(itemRef, {
     quantidadeAtual: newQty,
-    abriuUltimaUnidade: false,
-    abriuEm: null,
+    ...(shouldClearRed ? { entrouVermelhoEm: null } : {}),
     updatedAt: serverTimestamp()
   });
 
@@ -368,27 +362,6 @@ async function renderCategorias(currentUser) {
     catName.value = "";
     await renderCategorias(currentUser);
   };
-
-  content.onclick = async (e) => {
-    const btn = e.target?.closest("button");
-    if (!btn) return;
-
-    const editId = btn.getAttribute("data-editcat");
-    const delId = btn.getAttribute("data-delcat");
-
-    if (editId) {
-      const newName = prompt("Novo nome da categoria:");
-      if (!newName || !newName.trim()) return;
-      await updateDoc(doc(db, "categories", editId), { name: newName.trim(), updatedAt: serverTimestamp() });
-      await renderCategorias(currentUser);
-    }
-
-    if (delId) {
-      if (!confirm("Excluir categoria? (itens não são apagados automaticamente)")) return;
-      await deleteDoc(doc(db, "categories", delId));
-      await renderCategorias(currentUser);
-    }
-  };
 }
 
 // -----------------------------
@@ -397,9 +370,7 @@ async function renderCategorias(currentUser) {
 async function renderItens(currentUser) {
   UI_STATE.screen = "itens"; saveUIState();
 
-  // snapshot do foco/cursor ANTES de destruir o HTML
   const focusSnap = snapshotSearchFocus();
-
   content.innerHTML = `<div class="muted">Carregando itens...</div>`;
 
   const catsCol = collection(db, "categories");
@@ -502,7 +473,6 @@ async function renderItens(currentUser) {
     renderItens(currentUser);
   };
 
-  // FIX: debounce + não recriar a tela a cada tecla imediatamente
   searchInputEl.oninput = () => {
     UI_STATE.searchText = searchInputEl.value;
     saveUIState();
@@ -521,7 +491,6 @@ async function renderItens(currentUser) {
     if (e.key === "Enter") e.preventDefault();
   };
 
-  // restaura foco se estava digitando
   restoreSearchFocus(focusSnap);
 
   // Adicionar item (admin)
@@ -554,10 +523,9 @@ async function renderItens(currentUser) {
         payload.statusCor = "verde";
       } else {
         payload.quantidadeAtual = 0;
-        payload.quantidadeMinima = 1;     // ESTOQUE MÍNIMO (default)
-        payload.duracaoMediaDias = 7;     // DURAÇÃO (default)
-        payload.abriuUltimaUnidade = false;
-        payload.abriuEm = null;
+        payload.quantidadeMinima = 1;
+        payload.duracaoMediaDias = 7;
+        payload.entrouVermelhoEm = null; // novo campo (data do vermelho)
       }
 
       await addDoc(collection(db, "items"), payload);
@@ -566,131 +534,6 @@ async function renderItens(currentUser) {
       await renderItens(currentUser);
     };
   }
-
-  // ações
-  content.onclick = async (e) => {
-    const btn = e.target?.closest("button");
-    if (!btn) return;
-
-    // preserva filtros
-    const fcNow = document.getElementById("filterCat");
-    const siNow = document.getElementById("searchInput");
-    if (fcNow) UI_STATE.filterCategory = fcNow.value;
-    if (siNow) UI_STATE.searchText = siNow.value;
-    saveUIState();
-
-    const idSaveStatus = btn.getAttribute("data-savestatus");
-    const idSaveQty = btn.getAttribute("data-saveqty");
-    const idBuy = btn.getAttribute("data-buy");
-    const idEdit = btn.getAttribute("data-edit");
-    const idDelete = btn.getAttribute("data-del");
-
-    try {
-      if (idBuy) {
-        const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
-        await handleComprei(it, currentUser, "itens");
-        return;
-      }
-
-      if (idEdit) {
-        if (!admin) return alert("Apenas ADMIN pode editar itens.");
-        const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
-
-        const newName = prompt("Novo nome do item:", it.name || "");
-        if (newName === null) return;
-
-        const newUnit = prompt("Nova unidade (ex: un, pct, kg, L, dias):", it.unit || "un");
-        if (newUnit === null) return;
-
-        const newCat = prompt("Nova categoria (deixe em branco para manter):", it.categoryName || "");
-        if (newCat === null) return;
-
-        const finalName = (newName || "").trim();
-        const finalUnit = (newUnit || "").trim() || "un";
-        const finalCat = (newCat || "").trim() || it.categoryName || "";
-
-        if (!finalName) return alert("Nome não pode ficar vazio.");
-        if (!finalCat) return alert("Categoria não pode ficar vazia.");
-
-        const horti = isHortifrutiCategory(finalCat);
-
-        const updatePayload = {
-          name: finalName,
-          unit: finalUnit,
-          categoryName: finalCat,
-          control: horti ? "status" : "quantidade",
-          updatedAt: serverTimestamp(),
-        };
-
-        if (horti) {
-          updatePayload.statusCor = (it.statusCor || "verde");
-        } else {
-          updatePayload.quantidadeMinima = Number.isFinite(Number(it.quantidadeMinima)) ? Number(it.quantidadeMinima) : 1;
-          updatePayload.duracaoMediaDias = Number.isFinite(Number(it.duracaoMediaDias)) ? Number(it.duracaoMediaDias) : 7;
-          updatePayload.quantidadeAtual = Number.isFinite(Number(it.quantidadeAtual)) ? Number(it.quantidadeAtual) : 0;
-          updatePayload.abriuUltimaUnidade = it.abriuUltimaUnidade === true;
-        }
-
-        await updateDoc(doc(db, "items", idEdit), updatePayload);
-        await renderItens(currentUser);
-        return;
-      }
-
-      if (idDelete) {
-        if (!admin) return alert("Apenas ADMIN pode excluir itens.");
-        if (!confirm("Excluir este item?")) return;
-        await deleteDoc(doc(db, "items", idDelete));
-        await renderItens(currentUser);
-        return;
-      }
-
-      if (idSaveStatus) {
-        const sel = document.getElementById(`status-${idSaveStatus}`);
-        const val = (sel?.value || "verde").toLowerCase();
-        await updateDoc(doc(db, "items", idSaveStatus), { statusCor: val, updatedAt: serverTimestamp() });
-        await renderItens(currentUser);
-        return;
-      }
-
-      if (idSaveQty) {
-        const q = document.getElementById(`q-${idSaveQty}`);
-        const opened = document.getElementById(`opened-${idSaveQty}`);
-
-        // ETAPA 11: mínimos/duração (ADMIN)
-        const minEl = document.getElementById(`min-${idSaveQty}`);
-        const durEl = document.getElementById(`dur-${idSaveQty}`);
-
-        const quantidadeAtual = parseNonNegativeNumber(q?.value ?? 0, 0);
-        const abriuUltimaUnidade = opened?.checked === true;
-
-        const payload = {
-          quantidadeAtual,
-          abriuUltimaUnidade,
-          updatedAt: serverTimestamp()
-        };
-
-        if (admin && minEl && durEl) {
-          payload.quantidadeMinima = parsePositiveNumber(minEl.value, 1);
-          payload.duracaoMediaDias = parsePositiveNumber(durEl.value, 7);
-        }
-
-        const snap = await getDoc(doc(db, "items", idSaveQty));
-        if (snap.exists()) {
-          const old = snap.data();
-          const had = !!old.abriuEm;
-          if (abriuUltimaUnidade && !had) payload.abriuEm = serverTimestamp();
-          if (!abriuUltimaUnidade) payload.abriuEm = null;
-        }
-
-        await updateDoc(doc(db, "items", idSaveQty), payload);
-        await renderItens(currentUser);
-        return;
-      }
-    } catch (err) {
-      console.error(err);
-      alert(err?.message || "Erro ao salvar.");
-    }
-  };
 }
 
 function renderItemCard(it, admin) {
@@ -707,7 +550,7 @@ function renderItemCard(it, admin) {
         quantidadeAtual: it.quantidadeAtual,
         quantidadeMinima: it.quantidadeMinima,
         duracaoMediaDias: it.duracaoMediaDias,
-        abriuUltimaUnidade: it.abriuUltimaUnidade
+        entrouVermelhoEm: it.entrouVermelhoEm ?? null
       }))}' type="button">Editar</button>
       <button class="btn danger" data-del="${it.id}" type="button">Excluir</button>
     </div>
@@ -755,18 +598,16 @@ function renderItemCard(it, admin) {
   }
 
   const sev = computeQuantitySeverity(it);
-  const endDate = computeQuantityEndDate(it);
+  const endDate = (sev === "red") ? computeQuantityEndDate(it) : null;
   const label = sev === "red" ? "Vermelho" : sev === "yellow" ? "Amarelo" : "Verde";
 
   const qty = Number(it.quantidadeAtual ?? 0);
-  const opened = it.abriuUltimaUnidade === true;
-
   const min = Number.isFinite(Number(it.quantidadeMinima)) ? Number(it.quantidadeMinima) : 1;
   const dur = Number.isFinite(Number(it.duracaoMediaDias)) ? Number(it.duracaoMediaDias) : 7;
 
   const endLine = endDate
-    ? `Previsto para acabar: <strong>${escapeHtml(formatBR(endDate))}</strong>`
-    : `Previsto para acabar: <span class="muted">—</span>`;
+    ? `Duração após vermelho: <strong>${escapeHtml(formatBR(endDate))}</strong>`
+    : `Duração após vermelho: <span class="muted">—</span>`;
 
   const adminMinDur = admin ? `
     <div class="field" style="min-width:160px;">
@@ -798,11 +639,6 @@ function renderItemCard(it, admin) {
         <div class="field">
           <label>Qtd atual</label>
           <input id="q-${it.id}" type="number" value="${escapeHtml(qty)}" />
-        </div>
-
-        <div class="field" style="min-width:220px;">
-          <label>Abriu última unidade?</label>
-          <input id="opened-${it.id}" type="checkbox" ${opened ? "checked" : ""} />
         </div>
 
         ${adminMinDur}
@@ -860,22 +696,6 @@ async function renderCompras(currentUser) {
       </div>
     ` : `<div class="muted">Nada para comprar agora. Tudo em verde.</div>`}
   `;
-
-  content.onclick = async (e) => {
-    const btn = e.target?.closest("button");
-    if (!btn) return;
-
-    const id = btn.getAttribute("data-comprei");
-    if (!id) return;
-
-    try {
-      const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
-      await handleComprei(it, currentUser, "compras");
-    } catch (err) {
-      console.error(err);
-      alert(err?.message || "Erro ao confirmar compra.");
-    }
-  };
 }
 
 // -----------------------------
@@ -908,60 +728,6 @@ async function renderCheck(currentUser) {
       </div>
     ` : `<div class="muted">Nada pendente. Tudo em verde.</div>`}
   `;
-
-  content.onclick = async (e) => {
-    const btn = e.target?.closest("button");
-    if (!btn) return;
-
-    const idSaveStatus = btn.getAttribute("data-check-savestatus");
-    const idSaveQty = btn.getAttribute("data-check-saveqty");
-    const idBuy = btn.getAttribute("data-check-buy");
-
-    try {
-      if (idBuy) {
-        const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
-        await handleComprei(it, currentUser, "check");
-        return;
-      }
-
-      if (idSaveStatus) {
-        const sel = document.getElementById(`check-status-${idSaveStatus}`);
-        const val = (sel?.value || "verde").toLowerCase();
-        await updateDoc(doc(db, "items", idSaveStatus), { statusCor: val, updatedAt: serverTimestamp() });
-        await renderCheck(currentUser);
-        return;
-      }
-
-      if (idSaveQty) {
-        const q = document.getElementById(`check-q-${idSaveQty}`);
-        const opened = document.getElementById(`check-opened-${idSaveQty}`);
-
-        const quantidadeAtual = parseNonNegativeNumber(q?.value ?? 0, 0);
-        const abriuUltimaUnidade = opened?.checked === true;
-
-        const payload = {
-          quantidadeAtual,
-          abriuUltimaUnidade,
-          updatedAt: serverTimestamp()
-        };
-
-        const snap = await getDoc(doc(db, "items", idSaveQty));
-        if (snap.exists()) {
-          const old = snap.data();
-          const had = !!old.abriuEm;
-          if (abriuUltimaUnidade && !had) payload.abriuEm = serverTimestamp();
-          if (!abriuUltimaUnidade) payload.abriuEm = null;
-        }
-
-        await updateDoc(doc(db, "items", idSaveQty), payload);
-        await renderCheck(currentUser);
-        return;
-      }
-    } catch (err) {
-      console.error(err);
-      alert(err?.message || "Erro no Check.");
-    }
-  };
 }
 
 function renderCheckCard(it) {
@@ -980,20 +746,6 @@ function renderCheckCard(it) {
         </div>
 
         <div class="fields">
-          <div class="field" style="min-width:220px;">
-            <label>Cor</label>
-            <select id="check-status-${it.id}">
-              <option value="verde" ${norm(it.statusCor) === "verde" ? "selected" : ""}>Verde</option>
-              <option value="amarelo" ${norm(it.statusCor) === "amarelo" ? "selected" : ""}>Amarelo</option>
-              <option value="vermelho" ${norm(it.statusCor) === "vermelho" ? "selected" : ""}>Vermelho</option>
-            </select>
-          </div>
-
-          <div class="field" style="min-width:160px;">
-            <label>&nbsp;</label>
-            <button class="btn primary" data-check-savestatus="${it.id}" type="button">Salvar</button>
-          </div>
-
           <div class="field" style="min-width:160px;">
             <label>&nbsp;</label>
             <button class="btn" data-check-buy="${it.id}" data-itemjson='${escapeHtml(JSON.stringify({ id: it.id, name: it.name, categoryName: it.categoryName, control: "status" }))}' type="button">🛒 Comprei</button>
@@ -1004,11 +756,8 @@ function renderCheckCard(it) {
   }
 
   const endLine = it._endDate
-    ? `Previsto para acabar: <strong>${escapeHtml(formatBR(it._endDate))}</strong>`
-    : `Previsto para acabar: <span class="muted">—</span>`;
-
-  const qty = Number(it.quantidadeAtual ?? 0);
-  const opened = it.abriuUltimaUnidade === true;
+    ? `Dura até: <strong>${escapeHtml(formatBR(it._endDate))}</strong>`
+    : `Dura até: <span class="muted">—</span>`;
 
   return `
     <div class="item-card ${sev}">
@@ -1022,21 +771,6 @@ function renderCheckCard(it) {
       </div>
 
       <div class="fields">
-        <div class="field">
-          <label>Qtd atual</label>
-          <input id="check-q-${it.id}" type="number" value="${escapeHtml(qty)}" />
-        </div>
-
-        <div class="field" style="min-width:220px;">
-          <label>Abriu última unidade?</label>
-          <input id="check-opened-${it.id}" type="checkbox" ${opened ? "checked" : ""} />
-        </div>
-
-        <div class="field" style="min-width:160px;">
-          <label>&nbsp;</label>
-          <button class="btn primary" data-check-saveqty="${it.id}" type="button">Salvar</button>
-        </div>
-
         <div class="field" style="min-width:160px;">
           <label>&nbsp;</label>
           <button class="btn" data-check-buy="${it.id}" data-itemjson='${escapeHtml(JSON.stringify({ id: it.id, name: it.name, categoryName: it.categoryName, control: "quantidade" }))}' type="button">🛒 Comprei</button>
@@ -1049,6 +783,8 @@ function renderCheckCard(it) {
 // -----------------------------
 // Login flow
 // -----------------------------
+let CURRENT_USER = null;
+
 async function loginFlow(userId) {
   await ensureAnonAuth();
 
@@ -1057,6 +793,8 @@ async function loginFlow(userId) {
     alert(`Não achei users/${userId} no Firestore. Crie esse documento (name/role).`);
     return;
   }
+
+  CURRENT_USER = userData;
 
   showAppHeader({ name: userData.name, role: userData.role });
 
@@ -1072,23 +810,206 @@ async function loginFlow(userId) {
 btnCategorias.onclick = () => {
   const userId = getSession();
   if (!userId) return;
-  fetchUserDoc(userId).then(u => renderCategorias(u)).catch(e => alert(e?.message || "Erro ao abrir Categorias."));
+  fetchUserDoc(userId).then(u => { CURRENT_USER = u; return renderCategorias(u); }).catch(e => alert(e?.message || "Erro ao abrir Categorias."));
 };
 btnItens.onclick = () => {
   const userId = getSession();
   if (!userId) return;
-  fetchUserDoc(userId).then(u => renderItens(u)).catch(e => alert(e?.message || "Erro ao abrir Itens."));
+  fetchUserDoc(userId).then(u => { CURRENT_USER = u; return renderItens(u); }).catch(e => alert(e?.message || "Erro ao abrir Itens."));
 };
 btnCompras.onclick = () => {
   const userId = getSession();
   if (!userId) return;
-  fetchUserDoc(userId).then(u => renderCompras(u)).catch(e => alert(e?.message || "Erro ao abrir Compras."));
+  fetchUserDoc(userId).then(u => { CURRENT_USER = u; return renderCompras(u); }).catch(e => alert(e?.message || "Erro ao abrir Compras."));
 };
 btnCheck.onclick = () => {
   const userId = getSession();
   if (!userId) return;
-  fetchUserDoc(userId).then(u => renderCheck(u)).catch(e => alert(e?.message || "Erro ao abrir Check."));
+  fetchUserDoc(userId).then(u => { CURRENT_USER = u; return renderCheck(u); }).catch(e => alert(e?.message || "Erro ao abrir Check."));
 };
+
+// -----------------------------
+// Ações (UM handler global para evitar conflito)
+// -----------------------------
+content.addEventListener("click", async (e) => {
+  const btn = e.target?.closest("button");
+  if (!btn) return;
+
+  const currentUser = CURRENT_USER;
+  if (!currentUser) return;
+
+  // preserva filtros (quando existirem no DOM)
+  const fcNow = document.getElementById("filterCat");
+  const siNow = document.getElementById("searchInput");
+  if (fcNow) UI_STATE.filterCategory = fcNow.value;
+  if (siNow) UI_STATE.searchText = siNow.value;
+  saveUIState();
+
+  const idComprei = btn.getAttribute("data-comprei");
+  const idCheckBuy = btn.getAttribute("data-check-buy");
+  const idBuy = btn.getAttribute("data-buy");
+
+  const idSaveStatus = btn.getAttribute("data-savestatus");
+  const idSaveQty = btn.getAttribute("data-saveqty");
+  const idEdit = btn.getAttribute("data-edit");
+  const idDelete = btn.getAttribute("data-del");
+
+  const editCatId = btn.getAttribute("data-editcat");
+  const delCatId = btn.getAttribute("data-delcat");
+
+  try {
+    // --- Compras -> Comprei
+    if (idComprei) {
+      const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
+      await handleComprei(it, currentUser, "compras");
+      return;
+    }
+
+    // --- Check -> Comprei
+    if (idCheckBuy) {
+      const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
+      await handleComprei(it, currentUser, "check");
+      return;
+    }
+
+    // --- Itens -> Comprei
+    if (idBuy) {
+      const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
+      await handleComprei(it, currentUser, "itens");
+      return;
+    }
+
+    // --- Categorias (ADMIN)
+    if (editCatId) {
+      if (!isAdmin(currentUser.role)) return alert("Apenas ADMIN pode editar categorias.");
+      const newName = prompt("Novo nome da categoria:");
+      if (!newName || !newName.trim()) return;
+      await updateDoc(doc(db, "categories", editCatId), { name: newName.trim(), updatedAt: serverTimestamp() });
+      await renderCategorias(currentUser);
+      return;
+    }
+
+    if (delCatId) {
+      if (!isAdmin(currentUser.role)) return alert("Apenas ADMIN pode excluir categorias.");
+      if (!confirm("Excluir categoria? (itens não são apagados automaticamente)")) return;
+      await deleteDoc(doc(db, "categories", delCatId));
+      await renderCategorias(currentUser);
+      return;
+    }
+
+    // --- Itens: salvar status (hortifruti)
+    if (idSaveStatus) {
+      const sel = document.getElementById(`status-${idSaveStatus}`);
+      const val = (sel?.value || "verde").toLowerCase();
+      await updateDoc(doc(db, "items", idSaveStatus), { statusCor: val, updatedAt: serverTimestamp() });
+      await renderItens(currentUser);
+      return;
+    }
+
+    // --- Itens: salvar quantidade/min/dur
+    if (idSaveQty) {
+      const admin = isAdmin(currentUser.role);
+
+      const q = document.getElementById(`q-${idSaveQty}`);
+      const minEl = document.getElementById(`min-${idSaveQty}`);
+      const durEl = document.getElementById(`dur-${idSaveQty}`);
+
+      const quantidadeAtual = parseNonNegativeNumber(q?.value ?? 0, 0);
+
+      const payload = {
+        quantidadeAtual,
+        updatedAt: serverTimestamp()
+      };
+
+      // Só ADMIN altera mínimo/duração
+      if (admin && minEl && durEl) {
+        payload.quantidadeMinima = parsePositiveNumber(minEl.value, 1);
+        payload.duracaoMediaDias = parsePositiveNumber(durEl.value, 7);
+      }
+
+      const snap = await getDoc(doc(db, "items", idSaveQty));
+      if (snap.exists()) {
+        const old = snap.data();
+
+        const min = Number(payload.quantidadeMinima ?? old.quantidadeMinima ?? 1);
+        const oldQty = Number(old.quantidadeAtual ?? 0);
+
+        const wasRed = oldQty < min;
+        const isRedNow = quantidadeAtual < min;
+
+        // ✅ FIX: se está vermelho e ainda não tem timestamp, grava (mesmo para itens antigos)
+        if (isRedNow && !old.entrouVermelhoEm) {
+          payload.entrouVermelhoEm = serverTimestamp();
+        }
+
+        // saiu do vermelho (>= min) -> limpa timestamp
+        if (wasRed && !isRedNow) {
+          payload.entrouVermelhoEm = null;
+        }
+      }
+
+      await updateDoc(doc(db, "items", idSaveQty), payload);
+      await renderItens(currentUser);
+      return;
+    }
+
+    // --- Itens: editar/excluir
+    if (idEdit) {
+      if (!isAdmin(currentUser.role)) return alert("Apenas ADMIN pode editar itens.");
+      const it = JSON.parse(btn.getAttribute("data-itemjson") || "{}");
+
+      const newName = prompt("Novo nome do item:", it.name || "");
+      if (newName === null) return;
+
+      const newUnit = prompt("Nova unidade (ex: un, pct, kg, L, dias):", it.unit || "un");
+      if (newUnit === null) return;
+
+      const newCat = prompt("Nova categoria (deixe em branco para manter):", it.categoryName || "");
+      if (newCat === null) return;
+
+      const finalName = (newName || "").trim();
+      const finalUnit = (newUnit || "").trim() || "un";
+      const finalCat = (newCat || "").trim() || it.categoryName || "";
+
+      if (!finalName) return alert("Nome não pode ficar vazio.");
+      if (!finalCat) return alert("Categoria não pode ficar vazia.");
+
+      const horti = isHortifrutiCategory(finalCat);
+
+      const updatePayload = {
+        name: finalName,
+        unit: finalUnit,
+        categoryName: finalCat,
+        control: horti ? "status" : "quantidade",
+        updatedAt: serverTimestamp(),
+      };
+
+      if (horti) {
+        updatePayload.statusCor = (it.statusCor || "verde");
+      } else {
+        updatePayload.quantidadeMinima = Number.isFinite(Number(it.quantidadeMinima)) ? Number(it.quantidadeMinima) : 1;
+        updatePayload.duracaoMediaDias = Number.isFinite(Number(it.duracaoMediaDias)) ? Number(it.duracaoMediaDias) : 7;
+        updatePayload.quantidadeAtual = Number.isFinite(Number(it.quantidadeAtual)) ? Number(it.quantidadeAtual) : 0;
+        updatePayload.entrouVermelhoEm = it.entrouVermelhoEm ?? null;
+      }
+
+      await updateDoc(doc(db, "items", idEdit), updatePayload);
+      await renderItens(currentUser);
+      return;
+    }
+
+    if (idDelete) {
+      if (!isAdmin(currentUser.role)) return alert("Apenas ADMIN pode excluir itens.");
+      if (!confirm("Excluir este item?")) return;
+      await deleteDoc(doc(db, "items", idDelete));
+      await renderItens(currentUser);
+      return;
+    }
+  } catch (err) {
+    console.error(err);
+    alert(err?.message || "Erro ao executar ação.");
+  }
+});
 
 // -----------------------------
 // Entrar
@@ -1138,4 +1059,3 @@ onAuthStateChanged(auth, async () => {
     showLogin();
   }
 });
-
