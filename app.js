@@ -135,17 +135,27 @@ function norm(s) {
 function isAdmin(role) {
   return String(role || "").toLowerCase() === "admin";
 }
+
+/**
+ * ✅ FIX iOS: evita "Invalid Date"
+ */
 function addDays(dateISO, days) {
   const d = new Date(dateISO);
+  if (!Number.isFinite(d.getTime())) return null; // evita Invalid Date
   d.setDate(d.getDate() + Number(days || 0));
   return d.toISOString();
 }
+
+/**
+ * ✅ FIX iOS: se a data for inválida, retorna string vazia
+ */
 function formatBR(dateISO) {
-  try {
-    const d = new Date(dateISO);
-    return d.toLocaleDateString("pt-BR");
-  } catch { return ""; }
+  if (!dateISO) return "";
+  const d = new Date(dateISO);
+  if (!Number.isFinite(d.getTime())) return ""; // evita Invalid Date
+  return d.toLocaleDateString("pt-BR");
 }
+
 function parsePositiveInt(v) {
   const n = Number(String(v ?? "").replace(",", "."));
   if (!Number.isFinite(n)) return null;
@@ -162,9 +172,35 @@ function parsePositiveNumber(v, fallback = 1) {
   if (!Number.isFinite(n)) return fallback;
   return n <= 0 ? fallback : n;
 }
+
+/**
+ * ✅ FIX iOS: aceita Timestamp Firestore, {seconds,nanoseconds}, string, number
+ */
 function tsToISO(maybeTs) {
   if (!maybeTs) return null;
-  return (maybeTs?.toDate?.() ? maybeTs.toDate().toISOString() : String(maybeTs));
+
+  // Firestore Timestamp padrão
+  if (typeof maybeTs?.toDate === "function") {
+    const d = maybeTs.toDate();
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
+  // Caso tenha vindo como {seconds, nanoseconds}
+  if (typeof maybeTs === "object" && maybeTs.seconds != null) {
+    const sec = Number(maybeTs.seconds);
+    const ns = Number(maybeTs.nanoseconds || 0);
+    const ms = (sec * 1000) + Math.floor(ns / 1e6);
+    const d = new Date(ms);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
+  // String/Number (ISO, epoch etc.)
+  if (typeof maybeTs === "string" || typeof maybeTs === "number") {
+    const d = new Date(maybeTs);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
+  return null;
 }
 
 // -----------------------------
@@ -234,12 +270,13 @@ function computeQuantitySeverity(item) {
 /**
  * Data só quando entra no vermelho:
  * endDate = entrouVermelhoEm + duracaoMediaDias
+ * ✅ FIX iOS: se addDays retornar null, segura também
  */
 function computeQuantityEndDate(item) {
   const dur = Number(item.duracaoMediaDias ?? 7);
   const enteredISO = tsToISO(item.entrouVermelhoEm);
   if (!enteredISO) return null;
-  return addDays(enteredISO, dur);
+  return addDays(enteredISO, dur); // pode retornar null com segurança
 }
 
 function computeItemSeverityAndReason(it) {
@@ -484,7 +521,7 @@ async function renderItens(currentUser) {
         await renderItens(currentUser);
         restoreSearchFocus(snap);
       })();
-    }, 200);
+    }, 800); // ✅ debounce aumentado (troque para 700 ou 900 se quiser)
   };
 
   searchInputEl.onkeydown = (e) => {
@@ -1059,3 +1096,5 @@ onAuthStateChanged(auth, async () => {
     showLogin();
   }
 });
+
+  
